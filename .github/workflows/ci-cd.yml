@@ -1,0 +1,96 @@
+# workflow 이름
+name: Express Blue/Green CI/CD
+
+# event 설정
+# main 브랜치로 push 이벤트가 발생하면 실행
+on:
+  push:
+    branches:
+      - main
+
+# job 정의
+jobs:
+  # actions 컴퓨터인 ubuntu에서 도커 이미지 빌드 및 docker hub로 푸시
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Docker Hub Login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Build and Push Image
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/express-healthcheck:latest .
+          docker push ${{ secrets.DOCKER_USERNAME }}/express-healthcheck:latest
+
+  # 배포 job
+  deploy:
+    # 이미지 빌드 및 푸시를 끝내고 이후에 실행해야 한다.
+    # 왜냐하면 EC2 내부에서 이미지를 직접 가져올 것이기 때문에 hub에 미리 올려둬야 하기 때문이다.
+    needs: build-and-push
+    # actions 컴퓨터 ubuntu로 실행
+    runs-on: ubuntu-latest
+    # job의 step 정의
+    steps:
+      # actions 컴퓨터 ssh 설정. Actions의 ubuntu에서 EC2 ubuntu의 ssh키를 추가하여 EC2로 SSH 접속하기 위함
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      # EC2로 SSH 접속 후 배포
+      - name: Deploy to EC2
+        run: |
+          ssh -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} 'bash -s' <<EOF
+          set -e
+          cd /home/${{ secrets.SERVER_USER }}/bluegreen
+
+          if docker ps | grep express-healthcheck-blue; then
+            TARGET=green
+            STOP=express-healthcheck-blue
+          elif docker ps | grep express-healthcheck-green; then
+            TARGET=blue
+            STOP=express-healthcheck-green
+          else
+            TARGET=blue
+            STOP=none
+          fi
+
+          echo "Deploying to: \$TARGET"
+          docker compose pull express-healthcheck-\$TARGET
+          docker compose up -d express-healthcheck-\$TARGET
+
+          if [ "\$STOP" != "none" ]; then
+            echo "Running health check..."
+            for i in {1..10}; do
+              sleep 2
+              if docker exec express-healthcheck-\$TARGET curl -s http://localhost:3000/health; then
+                echo "Health check passed"
+                break
+              elif [ \$i -eq 10 ]; then
+                echo "Health check failed. Rolling back..."
+                docker stop express-healthcheck-\$TARGET
+                docker compose restart \$STOP
+                exit 1
+              fi
+            done
+          else
+            echo "First deploy — skipping health check"
+          fi
+
+          echo "Switching Nginx to \$TARGET"
+          sed -i "s/express-healthcheck-[a-z]\\+/express-healthcheck-\$TARGET/g" nginx.conf
+          docker stop nginx-proxy || true
+          docker rm -f nginx-proxy || true
+          docker compose up -d nginx-proxy
+
+          if [ "\$STOP" != "none" ]; then
+            docker stop \$STOP || true
+          fi
+          EOF
